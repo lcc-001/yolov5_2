@@ -28,7 +28,7 @@ from utils.torch_utils import copy_attr, smart_inference_mode, time_sync
 
 
 def autopad(k, p=None):  # kernel, padding
-    # Pad to 'same'
+    # Pad to 'same' 当没有给定padding值的时候，基于kernel大小，计算padding大小，保证输出fearure map大小不变
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
@@ -107,7 +107,13 @@ class Bottleneck(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        x1 = self.cv1(x)
+        x2 = self.cv2(x1)
+        if self.add:
+            return x + x2
+        else:
+            return x2
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
@@ -143,18 +149,23 @@ class CrossConv(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
-class C3(nn.Module):
+class C3(nn.Module): # CSP1_X
     # CSP Bottleneck with 3 convolutions
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1) # 1*1卷积 --> 将通道数目缩减的过程&分割
+        self.cv2 = Conv(c1, c_, 1, 1) # 1*1卷积 --> 将通道数目缩减的过程&分割
         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        x1 = self.cv2(x) # 通道分割 [N,C,H,W]-->[N,C1,H,W]
+        x2 = self.cv1(x) # 通道分割 [N,C,H,W]-->[N,C2,H,W]   C1==C2
+        x2 = self.m(x2) # 特征的提取融合 [N,C2,H,W]-->[N,C2,H,W]
+        x = torch.cat([x2, x1],dim=1)  #[N,C1+C2,H,W] 相当于两个分支的数据合并
+        return self.cv3(x)
+        # return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class C3x(C3):

@@ -42,12 +42,13 @@ class Detect(nn.Module):
 
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
-        self.nl = len(anchors)  # number of detection layers
-        self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        self.nc = nc  # 物体类别数目
+        self.no = nc + 5  # 每个anchor的预测输出值得数目 = 类别数目 + 1 + 边框回归系数（4）
+        self.nl = len(anchors)  # 有几层作为预测输出 默认为3
+        self.na = len(anchors[0]) // 2  # 每层预测每个点预测几个anchor box 默认为3
+        self.grid = [torch.zeros(1)] * self.nl  #
         self.anchor_grid = [torch.zeros(1)] * self.nl  # init anchor grid
+        # register_buffer：注册一个特殊变量，这个变量不会参与反梯度更新，但是会在模型持久化的时候保存在磁盘当中
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
@@ -57,7 +58,7 @@ class Detect(nn.Module):
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous() # 把255拆分成3*85的操作  [1,3,32,32,85] 前面的是anchor的数目
 
             if not self.training:  # inference
                 if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
@@ -166,6 +167,7 @@ class DetectionModel(BaseModel):
         if anchors:
             LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+        # 模型基于yaml配置文件构建
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
@@ -176,7 +178,7 @@ class DetectionModel(BaseModel):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)  # must be in pixel-space (not grid-space)
+            check_anchor_order(m)  # must be in pixel-space (not grid-space) 排个序 小物体-->中等物体-->大物体
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases()  # only run once
@@ -193,11 +195,11 @@ class DetectionModel(BaseModel):
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
-        s = [1, 0.83, 0.67]  # scales
+        s = [1, 0.83, 0.67]  # 预测过程当中的图像缩放比
         f = [None, 3, None]  # flips (2-ud, 3-lr)
-        y = []  # outputs
+        y = []  # outputs 输出结果的临时保存对象
         for si, fi in zip(s, f):
-            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max())) #图像缩放
             yi = self._forward_once(xi)[0]  # forward
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
@@ -276,26 +278,26 @@ class ClassificationModel(BaseModel):
 def parse_model(d, ch):  # model_dict, input_channels(3)
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
-    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors 每个点预测几个anchor box
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5) 每个点的输出向量维度大小 = 类别数目 + 4（边框回归值）+ 1（背景判断值）* na
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from（从哪一层连接过来）, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
 
-        n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain计算操作重复的次数，受参数depth_multiple的影响
         if m in (Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                  BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x):
-            c1, c2 = ch[f], args[0]
+            c1, c2 = ch[f], args[0]  # 输入的通道数目，输出的通道数目
             if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, 8)
+                c2 = make_divisible(c2 * gw, 8) # 只要不是最后一层（预测输出层），所有的输出通道数目乘以width_multiple进行宽度控制（通道数目）
 
             args = [c1, c2, *args[1:]]
             if m in [BottleneckCSP, C3, C3TR, C3Ghost, C3x]:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)  # number of repeats 针对这几个结构模块儿，将重复次数作为参数传递进去
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
@@ -312,16 +314,16 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace('__main__.', '')  # module type
-        np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module 真正的当前层的模块儿对象的构建
+        t = str(m)[8:-2].replace('__main__.', '')  # module type  模块儿类型
+        np = sum(x.numel() for x in m_.parameters())  # number params 模块儿内部的总参数量
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params  将必要的信息添加到模块儿中作为属性存在
         LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)
+        ch.append(c2) #保存每一层的输出通道数目
     return nn.Sequential(*layers), sorted(save)
 
 

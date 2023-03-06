@@ -1,6 +1,7 @@
 # YOLOv5 🚀 by Ultralytics, GPL-3.0 license
 """
 Loss functions
+
 """
 
 import torch
@@ -119,24 +120,25 @@ class ComputeLoss:
         self.device = device
 
     def __call__(self, p, targets):  # predictions, targets
-        lcls = torch.zeros(1, device=self.device)  # class loss
-        lbox = torch.zeros(1, device=self.device)  # box loss
-        lobj = torch.zeros(1, device=self.device)  # object loss
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        lcls = torch.zeros(1, device=self.device)  # 物体类别损失
+        lbox = torch.zeros(1, device=self.device)  # 边框坐标回归损失
+        lobj = torch.zeros(1, device=self.device)  # 物体背景损失
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets 只是计算出真实边框和先验边框之间的关系
 
-        # Losses
-        for i, pi in enumerate(p):  # layer index, layer predictions
-            b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+        # Losses 计算损失
+        for i, pi in enumerate(p):  # layer index, layer predictions（预测的置信度）
+            b, a, gj, gi = indices[i]  # 下标索引，b是一个批次中第几张图片，a是三个anchor中第几个，gj就是h（哪个单元格负责），gi是x
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # 预测边框
 
-            n = b.shape[0]  # number of targets
+            n = b.shape[0]  # 获取当前层匹配的真实边框的数目
             if n:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
+                # pi[b, a, gj, gi]后去当前gbox由哪个单元格内的哪个anchor负责预测
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
-                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
+                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i] #预测的高度和宽度是相比于先验框大小的，预测边框的大小最大是先验边框的四倍
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
@@ -148,7 +150,7 @@ class ComputeLoss:
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                tobj[b, a, gj, gi] = iou  # 如果某个单元格的某个anchor存在匹配的预测图像，那么将真实值（是否有物体的值）设置为iou
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -160,23 +162,26 @@ class ComputeLoss:
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-            obji = self.BCEobj(pi[..., 4], tobj)
-            lobj += obji * self.balance[i]  # obj loss
+            obji = self.BCEobj(pi[..., 4], tobj) # 计算是否有物体的损失（背景）
+            lobj += obji * self.balance[i]  # 会存在大量的背景损失，所以对是否有物品的损失做一个加权
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
 
         if self.autobalance:
             self.balance = [x / self.balance[self.ssi] for x in self.balance]
-        lbox *= self.hyp['box']
-        lobj *= self.hyp['obj']
-        lcls *= self.hyp['cls']
-        bs = tobj.shape[0]  # batch size
+        lbox *= self.hyp['box'] # 回归损失
+        lobj *= self.hyp['obj'] # 分类损失
+        lcls *= self.hyp['cls'] # 是否有物体损失
+        bs = tobj.shape[0]  # 批次大小
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach() #返回合并之后的损失和分开的损失
 
     def build_targets(self, p, targets):
+        """
+
+        """
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        na, nt = self.na, targets.shape[0]  # 每个锚点预测的边框数目和总的真实边框数目
         tcls, tbox, indices, anch = [], [], [], []
         gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
@@ -195,23 +200,24 @@ class ComputeLoss:
             device=self.device).float() * g  # offsets
 
         for i in range(self.nl):
-            anchors, shape = self.anchors[i], p[i].shape
-            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
+            anchors, shape = self.anchors[i], p[i].shape #获取得到第i层的anchor的先验框大小以及该层的预测的featire map大小
+            # 实际上获取的就是feature map的宽度，高度，宽度，高度，xyxy gain，填充当前的feature amp的大小作为可能选择的中心点以及宽度高度
+            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # 填充当前层的feature map的大小作为框可能选择的中心点以及宽度高度
 
             # Match targets to anchors
-            t = targets * gain  # shape(3,n,7)
+            t = targets * gain  # shape(3,n,7) targets真实边框的xywh的百分比*gain--->得到的就是这个真实边框的中心点坐标以及宽度高度
             if nt:
                 # Matches
-                r = t[..., 4:6] / anchors[:, None]  # wh ratio
+                r = t[..., 4:6] / anchors[:, None]  # 先获取真实边框的宽度和高度，和先验框计算比例
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp['anchor_t']  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
-                t = t[j]  # filter
+                t = t[j]  # 提取当前这层负责的可能的边框
 
-                # Offsets
-                gxy = t[:, 2:4]  # grid xy
-                gxi = gain[[2, 3]] - gxy  # inverse
-                j, k = ((gxy % 1 < g) & (gxy > 1)).T
-                l, m = ((gxi % 1 < g) & (gxi > 1)).T
+                # Offsets 计算中心点距离边界的信息（左上右下，条件是：大于1并且小于0.5）
+                gxy = t[:, 2:4]  # 获取真实边框中心点坐标
+                gxi = gain[[2, 3]] - gxy  # 坐标反转
+                j, k = ((gxy % 1 < g) & (gxy > 1)).T # 计算中心点坐标距离单元格左边界和上边界是否在距离边界0.5的范围内（不在边缘的单元格内）
+                l, m = ((gxi % 1 < g) & (gxi > 1)).T # 计算中心点坐标距离单元格右边界和下边界是否在距离边界0.5的范围内
                 j = torch.stack((torch.ones_like(j), j, k, l, m))
                 t = t.repeat((5, 1, 1))[j]
                 offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
@@ -222,13 +228,13 @@ class ComputeLoss:
             # Define
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
-            gij = (gxy - offsets).long()
+            gij = (gxy - offsets).long() #计算的是考虑偏移的情况下，真实边框对应的单元格左上角坐标点   gxy（真实边框的中心点）
             gi, gj = gij.T  # grid indices
 
             # Append
             indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
-            anch.append(anchors[a])  # anchors
+            anch.append(anchors[a])  # anchors得到真实边框对应的先验边框大小
             tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
